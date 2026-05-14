@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -16,9 +17,9 @@ from gui.orders_panel import OrdersPanel
 from gui.preview_panel import PreviewPanel
 from gui.plot_tabs import FFTTab, OrderTab
 from app.fft_engine import compute_raw_fft, average_spectra_interp
-from app.order_engine import compute_order_spectrum_from_arrays, average_order_spectra
+from app.order_engine import compute_order_spectrum_from_arrays, average_order_spectra, rpm_to_angle
 from app.segmentation_engine import SegmentWindow
-from core.io import estimate_fs
+from core.io import estimate_fs, detect_encoder_ppr
 
 
 class _Worker(QObject):
@@ -34,20 +35,21 @@ class _Worker(QObject):
 
     def run(self):
         try:
-            fft_by_cat: dict[str, list] = defaultdict(list)
-            order_by_cat: dict[str, list] = defaultdict(list)
+            # {category: {axis_label: [(freqs, mag), ...]}}
+            fft_by_cat: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+            order_by_cat: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+
+            t_col = self.col_map.get("time")
+            r_col = self.col_map.get("rpm")
+            ang_col = self.col_map.get("angle")
+            axes: dict[str, str] = self.col_map.get("axes", {})
+            order_src = self.col_map.get("order_source", "angle")
 
             for entry in self.entries:
                 df = pd.read_csv(entry.file_path)
-                t_col = self.col_map.get("time")
-                a_col = self.col_map.get("accel")
-                r_col = self.col_map.get("rpm")
-                ang_col = self.col_map.get("angle")
-                if not t_col or not a_col:
+                if not t_col:
                     continue
-
                 time = df[t_col].values.astype(float)
-                accel = df[a_col].values.astype(float)
                 rpm_arr = (
                     df[r_col].values.astype(float)
                     if r_col and r_col in df.columns else None
@@ -62,26 +64,49 @@ class _Worker(QObject):
                 slices = [(w.i_start, w.i_end) for w in enabled] if enabled else [(0, len(time))]
 
                 for i0, i1 in slices:
-                    sig = accel[i0:i1]
                     t_sl = time[i0:i1]
-                    if len(sig) < 8:
+                    if len(t_sl) < 8:
                         continue
                     fs = estimate_fs(t_sl)
-                    fft_by_cat[entry.category].append(compute_raw_fft(sig, fs))
+                    rpm_sl = rpm_arr[i0:i1] if rpm_arr is not None else None
 
-                    if angle_arr is not None and rpm_arr is not None:
-                        result = compute_order_spectrum_from_arrays(
-                            angle_arr[i0:i1], sig, t_sl,
-                            rpm_arr[i0:i1], fs, self.samples_per_rev,
+                    # Determine angle for order analysis
+                    if order_src == "rpm_integrate" and rpm_sl is not None:
+                        ang_sl = rpm_to_angle(t_sl, rpm_sl)
+                    elif order_src == "angle" and angle_arr is not None:
+                        ang_sl = angle_arr[i0:i1]
+                    else:
+                        ang_sl = None
+
+                    for ax_label, ax_col in axes.items():
+                        if ax_col not in df.columns:
+                            continue
+                        sig = df[ax_col].values.astype(float)[i0:i1]
+                        if len(sig) < 8:
+                            continue
+                        fft_by_cat[entry.category][ax_label].append(
+                            compute_raw_fft(sig, fs)
                         )
-                        if result is not None:
-                            order_by_cat[entry.category].append(result)
+                        if ang_sl is not None and rpm_sl is not None:
+                            result = compute_order_spectrum_from_arrays(
+                                ang_sl, sig, t_sl, rpm_sl, fs, self.samples_per_rev
+                            )
+                            if result is not None:
+                                order_by_cat[entry.category][ax_label].append(result)
 
             fft_results = {
-                cat: average_spectra_interp(sp) for cat, sp in fft_by_cat.items()
+                cat: {
+                    ax: average_spectra_interp(sp_list)
+                    for ax, sp_list in ax_dict.items()
+                }
+                for cat, ax_dict in fft_by_cat.items()
             }
             order_results = {
-                cat: average_order_spectra(sp) for cat, sp in order_by_cat.items()
+                cat: {
+                    ax: average_order_spectra(sp_list)
+                    for ax, sp_list in ax_dict.items()
+                }
+                for cat, ax_dict in order_by_cat.items()
             }
             self.finished.emit(fft_results, order_results)
         except Exception:
@@ -102,13 +127,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # Sidebar
+        # ── Sidebar ───────────────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(320)
+        scroll.setFixedWidth(330)
         sb = QWidget()
         sb_layout = QVBoxLayout(sb)
         sb_layout.setSpacing(6)
+
+        # Help toggle
+        self._help_btn = QPushButton("❓ Help")
+        self._help_btn.setCheckable(True)
+        self._help_btn.toggled.connect(self._toggle_help)
+        sb_layout.addWidget(self._help_btn)
 
         self._file_panel = FilePanel()
         sb_layout.addWidget(self._file_panel)
@@ -116,17 +147,41 @@ class MainWindow(QMainWindow):
         self._col_panel = ColumnPanel()
         sb_layout.addWidget(self._col_panel)
 
+        # Segmentation group
         det_box = QGroupBox("Segmentation")
         det_form = QFormLayout(det_box)
         self._rpm_thresh_spin = QDoubleSpinBox()
         self._rpm_thresh_spin.setRange(0, 50000)
         self._rpm_thresh_spin.setValue(100.0)
         det_form.addRow("RPM threshold:", self._rpm_thresh_spin)
+
+        # Samples/rev row with Auto button
+        spr_row = QWidget()
+        spr_layout = QHBoxLayout(spr_row)
+        spr_layout.setContentsMargins(0, 0, 0, 0)
         self._spr_spin = QSpinBox()
         self._spr_spin.setRange(64, 8192)
         self._spr_spin.setValue(1024)
-        det_form.addRow("Samples / rev:", self._spr_spin)
+        self._auto_btn = QPushButton("Auto")
+        self._auto_btn.setFixedWidth(46)
+        self._auto_btn.clicked.connect(self._auto_detect_spr)
+        spr_layout.addWidget(self._spr_spin, stretch=1)
+        spr_layout.addWidget(self._auto_btn)
+        det_form.addRow("Samples / rev:", spr_row)
+
+        self._seg_help = QLabel(
+            "RPM threshold: below this the shaft is considered stopped. "
+            "Samples/rev controls order resolution (higher = finer, slower). "
+            "Click Auto to detect from encoder PPR."
+        )
+        self._seg_help.setWordWrap(True)
+        self._seg_help.setVisible(False)
+        self._seg_help.setStyleSheet(
+            "background:#fffbe6;border:1px solid #e6d800;"
+            "border-radius:3px;padding:4px;font-size:11px;"
+        )
         sb_layout.addWidget(det_box)
+        sb_layout.addWidget(self._seg_help)
 
         self._orders_panel = OrdersPanel()
         sb_layout.addWidget(self._orders_panel)
@@ -143,7 +198,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(sb)
         root.addWidget(scroll)
 
-        # Right tabs
+        # ── Right tabs ────────────────────────────────────────────────────────
         self._tabs = QTabWidget()
         self._preview_panel = PreviewPanel()
         self._fft_tab = FFTTab()
@@ -157,6 +212,41 @@ class MainWindow(QMainWindow):
         self._run_btn.clicked.connect(self._run_analysis)
         self._preview_panel.selection_confirmed.connect(self._on_selection_confirmed)
 
+    # ── Help toggle ───────────────────────────────────────────────────────────
+    def _toggle_help(self, checked: bool):
+        self._file_panel.set_help_visible(checked)
+        self._col_panel.set_help_visible(checked)
+        self._seg_help.setVisible(checked)
+        self._orders_panel.set_help_visible(checked)
+        self._preview_panel.set_help_visible(checked)
+        self._fft_tab.set_help_visible(checked)
+        self._order_tab.set_help_visible(checked)
+
+    # ── Auto PPR detection ────────────────────────────────────────────────────
+    def _auto_detect_spr(self):
+        entries = self._file_panel.get_entries()
+        if not entries:
+            return
+        col_map = self._col_panel.get_mapping()
+        ang_col = col_map.get("angle")
+        if not ang_col:
+            QMessageBox.warning(
+                self, "No angle column",
+                "Auto-detect PPR requires an Angle/Encoder column to be mapped."
+            )
+            return
+        try:
+            df = pd.read_csv(entries[0].file_path)
+            if ang_col not in df.columns:
+                return
+            ppr = detect_encoder_ppr(df[ang_col].values.astype(float))
+            ppr_pow2 = 2 ** round(math.log2(max(ppr, 1)))
+            ppr_pow2 = max(64, min(8192, ppr_pow2))
+            self._spr_spin.setValue(ppr_pow2)
+        except Exception as exc:
+            QMessageBox.warning(self, "Auto-detect failed", str(exc))
+
+    # ── File loading ──────────────────────────────────────────────────────────
     def _on_files_changed(self):
         entries = self._file_panel.get_entries()
         if not entries:
@@ -173,8 +263,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No files", "Add at least one data file first.")
             return
         col_map = self._col_panel.get_mapping()
-        if not col_map.get("time") or not col_map.get("accel"):
-            QMessageBox.warning(self, "Columns", "Please map Time and Acceleration columns.")
+        if not col_map.get("time") or not col_map.get("axes"):
+            QMessageBox.warning(self, "Columns", "Please map Time and at least one Axis column.")
             return
         self._preview_panel.set_files([e.file_path for e in entries], col_map)
         self._tabs.setCurrentWidget(self._preview_panel)
@@ -183,14 +273,15 @@ class MainWindow(QMainWindow):
         self._event_windows[file_path] = windows
         self._run_analysis()
 
+    # ── Analysis ──────────────────────────────────────────────────────────────
     def _run_analysis(self):
         entries = self._file_panel.get_entries()
         if not entries:
             QMessageBox.warning(self, "No files", "Add at least one data file first.")
             return
         col_map = self._col_panel.get_mapping()
-        if not col_map.get("time") or not col_map.get("accel"):
-            QMessageBox.warning(self, "Columns", "Please map Time and Acceleration columns.")
+        if not col_map.get("time") or not col_map.get("axes"):
+            QMessageBox.warning(self, "Columns", "Please map Time and at least one Axis column.")
             return
         if self._thread and self._thread.isRunning():
             return
