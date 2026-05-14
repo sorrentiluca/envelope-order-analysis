@@ -1,13 +1,14 @@
 from __future__ import annotations
 import math
 from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QScrollArea, QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QLabel, QMessageBox, QTabWidget,
+    QLabel, QMessageBox, QTabWidget, QCheckBox, QComboBox,
 )
 from PySide6.QtCore import QThread, Signal, QObject
 
@@ -17,8 +18,10 @@ from gui.orders_panel import OrdersPanel
 from gui.preview_panel import PreviewPanel
 from gui.plot_tabs import FFTTab, OrderTab
 from app.fft_engine import compute_raw_fft, average_spectra_interp
-from app.order_engine import compute_order_spectrum_from_arrays, average_order_spectra, rpm_to_angle
-from app.segmentation_engine import SegmentWindow
+from app.order_engine import (
+    compute_order_spectrum_from_arrays, average_order_spectra, rpm_to_angle,
+)
+from app.segmentation_engine import SegmentWindow, detect_events
 from core.io import estimate_fs, detect_encoder_ppr
 
 
@@ -26,16 +29,21 @@ class _Worker(QObject):
     finished = Signal(dict, dict)
     error = Signal(str)
 
-    def __init__(self, entries, col_map, event_windows, samples_per_rev):
+    def __init__(self, entries, col_map, event_windows, samples_per_rev,
+                 detect_enabled, trigger_col, threshold, pre_s, post_s):
         super().__init__()
         self.entries = entries
         self.col_map = col_map
-        self.event_windows = event_windows
+        self.event_windows = event_windows  # pre-confirmed edits; worker may override
         self.samples_per_rev = samples_per_rev
+        self.detect_enabled = detect_enabled
+        self.trigger_col = trigger_col
+        self.threshold = threshold
+        self.pre_s = pre_s
+        self.post_s = post_s
 
     def run(self):
         try:
-            # {category: {axis_label: [(freqs, mag), ...]}}
             fft_by_cat: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
             order_by_cat: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
@@ -47,8 +55,9 @@ class _Worker(QObject):
 
             for entry in self.entries:
                 df = pd.read_csv(entry.file_path)
-                if not t_col:
+                if not t_col or t_col not in df.columns:
                     continue
+
                 time = df[t_col].values.astype(float)
                 rpm_arr = (
                     df[r_col].values.astype(float)
@@ -59,7 +68,23 @@ class _Worker(QObject):
                     if ang_col and ang_col in df.columns else None
                 )
 
-                windows: list[SegmentWindow] = self.event_windows.get(entry.file_path, [])
+                # Determine event windows for this file
+                if self.detect_enabled and self.trigger_col and self.trigger_col in df.columns:
+                    trig = df[self.trigger_col].values.astype(float)
+                    windows = detect_events(
+                        time, trig,
+                        threshold=self.threshold,
+                        pre_window_s=self.pre_s,
+                        post_window_s=self.post_s,
+                    )
+                    # Merge with any user-confirmed edits
+                    confirmed = self.event_windows.get(entry.file_path)
+                    if confirmed:
+                        windows = confirmed
+                else:
+                    confirmed = self.event_windows.get(entry.file_path)
+                    windows = confirmed if confirmed else []
+
                 enabled = [w for w in windows if w.enabled]
                 slices = [(w.i_start, w.i_end) for w in enabled] if enabled else [(0, len(time))]
 
@@ -70,7 +95,7 @@ class _Worker(QObject):
                     fs = estimate_fs(t_sl)
                     rpm_sl = rpm_arr[i0:i1] if rpm_arr is not None else None
 
-                    # Determine angle for order analysis
+                    # Synthesise angle for order analysis
                     if order_src == "rpm_integrate" and rpm_sl is not None:
                         ang_sl = rpm_to_angle(t_sl, rpm_sl)
                     elif order_src == "angle" and angle_arr is not None:
@@ -78,18 +103,24 @@ class _Worker(QObject):
                     else:
                         ang_sl = None
 
+                    # Fallback RPM for antialiasing when no RPM column
+                    rpm_for_resample = rpm_sl if rpm_sl is not None else np.ones(len(t_sl))
+
                     for ax_label, ax_col in axes.items():
                         if ax_col not in df.columns:
                             continue
                         sig = df[ax_col].values.astype(float)[i0:i1]
                         if len(sig) < 8:
                             continue
+
                         fft_by_cat[entry.category][ax_label].append(
                             compute_raw_fft(sig, fs)
                         )
-                        if ang_sl is not None and rpm_sl is not None:
+
+                        if ang_sl is not None:
                             result = compute_order_spectrum_from_arrays(
-                                ang_sl, sig, t_sl, rpm_sl, fs, self.samples_per_rev
+                                ang_sl, sig, t_sl, rpm_for_resample,
+                                fs, self.samples_per_rev,
                             )
                             if result is not None:
                                 order_by_cat[entry.category][ax_label].append(result)
@@ -120,8 +151,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Vibration Analyser")
         self.resize(1400, 820)
         self._event_windows: dict[str, list[SegmentWindow]] = {}
-        self._thread: QThread | None = None
-        self._worker: _Worker | None = None
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[_Worker] = None
+        self._all_columns: list[str] = []
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -130,7 +162,7 @@ class MainWindow(QMainWindow):
         # ── Sidebar ───────────────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(330)
+        scroll.setFixedWidth(340)
         sb = QWidget()
         sb_layout = QVBoxLayout(sb)
         sb_layout.setSpacing(6)
@@ -149,30 +181,62 @@ class MainWindow(QMainWindow):
 
         # Segmentation group
         det_box = QGroupBox("Segmentation")
-        det_form = QFormLayout(det_box)
-        self._rpm_thresh_spin = QDoubleSpinBox()
-        self._rpm_thresh_spin.setRange(0, 50000)
-        self._rpm_thresh_spin.setValue(100.0)
-        det_form.addRow("RPM threshold:", self._rpm_thresh_spin)
+        det_layout = QVBoxLayout(det_box)
+        det_form = QFormLayout()
 
-        # Samples/rev row with Auto button
+        # Samples/rev + Auto
         spr_row = QWidget()
-        spr_layout = QHBoxLayout(spr_row)
-        spr_layout.setContentsMargins(0, 0, 0, 0)
+        spr_h = QHBoxLayout(spr_row)
+        spr_h.setContentsMargins(0, 0, 0, 0)
         self._spr_spin = QSpinBox()
         self._spr_spin.setRange(64, 8192)
         self._spr_spin.setValue(1024)
         self._auto_btn = QPushButton("Auto")
         self._auto_btn.setFixedWidth(46)
         self._auto_btn.clicked.connect(self._auto_detect_spr)
-        spr_layout.addWidget(self._spr_spin, stretch=1)
-        spr_layout.addWidget(self._auto_btn)
+        spr_h.addWidget(self._spr_spin, stretch=1)
+        spr_h.addWidget(self._auto_btn)
         det_form.addRow("Samples / rev:", spr_row)
+        det_layout.addLayout(det_form)
+
+        # Detect Events checkbox
+        self._detect_chk = QCheckBox("Detect Events")
+        self._detect_chk.toggled.connect(self._on_detect_toggled)
+        det_layout.addWidget(self._detect_chk)
+
+        # Collapsible options
+        self._det_opts = QWidget()
+        opts_form = QFormLayout(self._det_opts)
+        opts_form.setContentsMargins(12, 0, 0, 0)
+
+        self._trigger_cb = QComboBox()
+        opts_form.addRow("Trigger column:", self._trigger_cb)
+
+        self._thresh_spin = QDoubleSpinBox()
+        self._thresh_spin.setRange(0, 1e9)
+        self._thresh_spin.setValue(100.0)
+        self._thresh_spin.setSingleStep(10)
+        opts_form.addRow("Threshold:", self._thresh_spin)
+
+        self._pre_spin = QDoubleSpinBox()
+        self._pre_spin.setRange(0, 3600)
+        self._pre_spin.setSingleStep(0.05)
+        self._pre_spin.setDecimals(3)
+        opts_form.addRow("Time before (s):", self._pre_spin)
+
+        self._post_spin = QDoubleSpinBox()
+        self._post_spin.setRange(0, 3600)
+        self._post_spin.setSingleStep(0.05)
+        self._post_spin.setDecimals(3)
+        opts_form.addRow("Time after (s):", self._post_spin)
+
+        self._det_opts.setVisible(False)
+        det_layout.addWidget(self._det_opts)
 
         self._seg_help = QLabel(
-            "RPM threshold: below this the shaft is considered stopped. "
-            "Samples/rev controls order resolution (higher = finer, slower). "
-            "Click Auto to detect from encoder PPR."
+            "Samples/rev controls order resolution. \"Detect Events\" slices each file "
+            "to spans where the trigger channel exceeds the threshold, extended by "
+            "Time before/after. When unchecked the whole file is used."
         )
         self._seg_help.setWordWrap(True)
         self._seg_help.setVisible(False)
@@ -198,7 +262,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(sb)
         root.addWidget(scroll)
 
-        # ── Right tabs ────────────────────────────────────────────────────────
+        # ── Right tabs ───────────────────────────────────────────────────────
         self._tabs = QTabWidget()
         self._preview_panel = PreviewPanel()
         self._fft_tab = FFTTab()
@@ -212,7 +276,7 @@ class MainWindow(QMainWindow):
         self._run_btn.clicked.connect(self._run_analysis)
         self._preview_panel.selection_confirmed.connect(self._on_selection_confirmed)
 
-    # ── Help toggle ───────────────────────────────────────────────────────────
+    # ── Help ──────────────────────────────────────────────────────────────────
     def _toggle_help(self, checked: bool):
         self._file_panel.set_help_visible(checked)
         self._col_panel.set_help_visible(checked)
@@ -222,7 +286,11 @@ class MainWindow(QMainWindow):
         self._fft_tab.set_help_visible(checked)
         self._order_tab.set_help_visible(checked)
 
-    # ── Auto PPR detection ────────────────────────────────────────────────────
+    # ── Detect Events toggle ──────────────────────────────────────────────────
+    def _on_detect_toggled(self, checked: bool):
+        self._det_opts.setVisible(checked)
+
+    # ── Auto PPR ──────────────────────────────────────────────────────────────
     def _auto_detect_spr(self):
         entries = self._file_panel.get_entries()
         if not entries:
@@ -241,37 +309,81 @@ class MainWindow(QMainWindow):
                 return
             ppr = detect_encoder_ppr(df[ang_col].values.astype(float))
             ppr_pow2 = 2 ** round(math.log2(max(ppr, 1)))
-            ppr_pow2 = max(64, min(8192, ppr_pow2))
-            self._spr_spin.setValue(ppr_pow2)
+            self._spr_spin.setValue(max(64, min(8192, ppr_pow2)))
         except Exception as exc:
             QMessageBox.warning(self, "Auto-detect failed", str(exc))
 
-    # ── File loading ──────────────────────────────────────────────────────────
+    # ── Files changed ─────────────────────────────────────────────────────────
     def _on_files_changed(self):
         entries = self._file_panel.get_entries()
         if not entries:
             return
         try:
             df = pd.read_csv(entries[0].file_path, nrows=5)
-            self._col_panel.update_columns(list(df.columns))
+            cols = list(df.columns)
+            self._all_columns = cols
+            self._col_panel.update_columns(cols)
+            # Repopulate trigger combobox
+            prev = self._trigger_cb.currentText()
+            self._trigger_cb.blockSignals(True)
+            self._trigger_cb.clear()
+            self._trigger_cb.addItems(cols)
+            if prev in cols:
+                self._trigger_cb.setCurrentText(prev)
+            self._trigger_cb.blockSignals(False)
         except Exception:
             pass
 
+    # ── Preview ───────────────────────────────────────────────────────────────
     def _open_preview(self):
         entries = self._file_panel.get_entries()
         if not entries:
             QMessageBox.warning(self, "No files", "Add at least one data file first.")
             return
         col_map = self._col_panel.get_mapping()
-        if not col_map.get("time") or not col_map.get("axes"):
-            QMessageBox.warning(self, "Columns", "Please map Time and at least one Axis column.")
+        if not col_map.get("time"):
+            QMessageBox.warning(self, "Columns", "Please map the Time column.")
             return
-        self._preview_panel.set_files([e.file_path for e in entries], col_map)
+
+        # Run detection on all files if enabled
+        events_by_file: dict[str, list[SegmentWindow]] = {}
+        detect_enabled = self._detect_chk.isChecked()
+        trigger_col = self._trigger_cb.currentText() if detect_enabled else None
+        threshold = self._thresh_spin.value()
+        pre_s = self._pre_spin.value()
+        post_s = self._post_spin.value()
+
+        for entry in entries:
+            # Use confirmed edits if available, else re-detect
+            if entry.file_path in self._event_windows:
+                events_by_file[entry.file_path] = self._event_windows[entry.file_path]
+            elif detect_enabled and trigger_col:
+                try:
+                    df = pd.read_csv(entry.file_path)
+                    t_col = col_map.get("time")
+                    if t_col and t_col in df.columns and trigger_col in df.columns:
+                        time = df[t_col].values.astype(float)
+                        trig = df[trigger_col].values.astype(float)
+                        events_by_file[entry.file_path] = detect_events(
+                            time, trig, threshold=threshold,
+                            pre_window_s=pre_s, post_window_s=post_s,
+                        )
+                except Exception:
+                    events_by_file[entry.file_path] = []
+            else:
+                events_by_file[entry.file_path] = []
+
+        self._preview_panel.set_files(
+            [e.file_path for e in entries],
+            col_map,
+            events_by_file,
+            trigger_col=trigger_col,
+            threshold=threshold,
+        )
         self._tabs.setCurrentWidget(self._preview_panel)
 
-    def _on_selection_confirmed(self, file_path: str, windows: list):
-        self._event_windows[file_path] = windows
-        self._run_analysis()
+    def _on_selection_confirmed(self, events_by_file: dict):
+        self._event_windows.update(events_by_file)
 
     # ── Analysis ──────────────────────────────────────────────────────────────
     def _run_analysis(self):
@@ -280,8 +392,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No files", "Add at least one data file first.")
             return
         col_map = self._col_panel.get_mapping()
-        if not col_map.get("time") or not col_map.get("axes"):
-            QMessageBox.warning(self, "Columns", "Please map Time and at least one Axis column.")
+        if not col_map.get("time"):
+            QMessageBox.warning(self, "Columns", "Please map the Time column.")
+            return
+        if not col_map.get("axes"):
+            QMessageBox.warning(self, "Columns", "Please enable at least one Axis column.")
             return
         if self._thread and self._thread.isRunning():
             return
@@ -290,7 +405,15 @@ class MainWindow(QMainWindow):
         self._run_btn.setText("Running…")
 
         self._worker = _Worker(
-            entries, col_map, self._event_windows, self._spr_spin.value()
+            entries=entries,
+            col_map=col_map,
+            event_windows=dict(self._event_windows),
+            samples_per_rev=self._spr_spin.value(),
+            detect_enabled=self._detect_chk.isChecked(),
+            trigger_col=self._trigger_cb.currentText() if self._detect_chk.isChecked() else None,
+            threshold=self._thresh_spin.value(),
+            pre_s=self._pre_spin.value(),
+            post_s=self._post_spin.value(),
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)

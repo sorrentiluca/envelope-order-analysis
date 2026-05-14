@@ -12,6 +12,8 @@ _CAT_COLORS = [
 
 
 def _draw_fault_vlines(ax, fault_orders: list[FaultOrder], x_max: float):
+    if x_max <= 0 or not fault_orders:
+        return
     for fo in fault_orders:
         labeled = False
         for n in range(1, fo.n_harmonics + 1):
@@ -19,7 +21,7 @@ def _draw_fault_vlines(ax, fault_orders: list[FaultOrder], x_max: float):
             if x > x_max:
                 break
             alpha = max(0.15, 0.9 / n)
-            lw = 1.2 if n == 1 else 0.7
+            lw = 1.4 if n == 1 else 0.8
             ls = "-" if n == 1 else "--"
             label = f"{fo.name} ({fo.fundamental}×)" if not labeled else None
             ax.axvline(x, color=fo.color, alpha=alpha, linewidth=lw, linestyle=ls, label=label)
@@ -27,17 +29,14 @@ def _draw_fault_vlines(ax, fault_orders: list[FaultOrder], x_max: float):
 
 
 def _combine_spectra(axis_spectra: list[tuple], method: str = "sum") -> tuple:
-    """Combine per-axis (x, mag) pairs into a single spectrum."""
-    if not axis_spectra:
-        return np.array([0.0]), np.array([0.0])
-    if len(axis_spectra) == 1:
-        return axis_spectra[0]
     valid = [(f, m) for f, m in axis_spectra if len(f) > 1]
     if not valid:
         return np.array([0.0]), np.array([0.0])
+    if len(valid) == 1:
+        return valid[0]
     f_max = min(f[-1] for f, _ in valid)
-    df = max(f[1] - f[0] for f, _ in valid)
-    n_pts = max(2, int(f_max / df) + 1)
+    df_step = max(f[1] - f[0] for f, _ in valid)
+    n_pts = max(2, int(f_max / df_step) + 1)
     common = np.linspace(0.0, f_max, n_pts)
     interped = []
     for freqs, mag in valid:
@@ -52,8 +51,6 @@ def _combine_spectra(axis_spectra: list[tuple], method: str = "sum") -> tuple:
 
 
 class _SpectrumTab(QWidget):
-    """Base class shared by FFTTab and OrderTab."""
-
     def __init__(self, xlabel: str, title_prefix: str, help_text: str, parent=None):
         super().__init__(parent)
         self._xlabel = xlabel
@@ -136,7 +133,7 @@ class _SpectrumTab(QWidget):
                     continue
                 freqs, mag = cat_dict[ax_lbl]
                 if len(freqs) > 1:
-                    sp.plot(freqs, mag, lw=0.8, color=cat_color[cat], label=cat)
+                    sp.plot(freqs, mag, lw=0.9, color=cat_color[cat], label=cat)
                     x_max = max(x_max, float(freqs[-1]))
             sp.legend(fontsize=7)
 
@@ -154,9 +151,10 @@ class _SpectrumTab(QWidget):
                     x_max = max(x_max, float(freqs_c[-1]))
             sp.legend(fontsize=7)
 
-        if x_max > 0:
-            for sp in subplots:
-                _draw_fault_vlines(sp, fault_orders, x_max)
+        # Draw fault order vlines on all subplots
+        for sp in subplots:
+            _draw_fault_vlines(sp, fault_orders, x_max)
+            sp.legend(fontsize=7)
 
         subplots[-1].set_xlabel(self._xlabel)
         fig.tight_layout()
@@ -168,7 +166,7 @@ class FFTTab(_SpectrumTab):
         super().__init__(
             "Frequency (Hz)", "FFT Spectrum",
             "Raw frequency spectrum (Hz). Averaged across files in the same category. "
-            "Fault order vlines show as their raw numeric values on the Hz axis.",
+            "Fault order vlines are drawn at their order× value on the Hz axis.",
             parent,
         )
 
@@ -177,7 +175,7 @@ class OrderTab(_SpectrumTab):
     def __init__(self, parent=None):
         super().__init__(
             "Order (× shaft speed)", "Order Spectrum",
-            "Order spectrum: X-axis in multiples of shaft speed. "
+            "Order spectrum: X-axis is shaft-speed multiples. "
             "Signal resampled to uniform angle domain before FFT.",
             parent,
         )

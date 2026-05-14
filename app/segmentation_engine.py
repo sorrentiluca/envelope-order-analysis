@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
-from scipy.ndimage import uniform_filter1d
 
 
 @dataclass
@@ -13,40 +11,19 @@ class SegmentWindow:
     t_end: float
     i_start: int
     i_end: int
-    mean_rpm: float
-    plateau_t_start: Optional[float] = None
-    plateau_t_end: Optional[float] = None
+    mean_trigger: float
     enabled: bool = True
-
-
-def _find_plateau(rpm_seg: np.ndarray, speed_tol: float = 0.05) -> Optional[tuple]:
-    n = len(rpm_seg)
-    if n < 10:
-        return None
-    smooth = uniform_filter1d(np.abs(rpm_seg), size=max(3, n // 15))
-    peak_rpm = smooth.max()
-    if peak_rpm < 10.0:
-        return None
-    stable = np.abs(smooth - peak_rpm) / peak_rpm < speed_tol
-    padded = np.concatenate([[False], stable, [False]])
-    changes = np.diff(padded.astype(int))
-    starts = np.where(changes == 1)[0]
-    ends = np.where(changes == -1)[0]
-    if len(starts) == 0:
-        return None
-    best = int(np.argmax(ends - starts))
-    return int(starts[best]), int(ends[best])
 
 
 def detect_events(
     time: np.ndarray,
-    rpm: np.ndarray,
-    rpm_threshold: float = 100.0,
-    min_duration: float = 0.1,
-    speed_tol: float = 0.05,
+    trigger: np.ndarray,
+    threshold: float = 100.0,
+    pre_window_s: float = 0.0,
+    post_window_s: float = 0.0,
 ) -> list[SegmentWindow]:
-    """Return contiguous spans where |rpm| > threshold, with plateau sub-windows."""
-    above = np.abs(rpm) > rpm_threshold
+    """Find spans where |trigger| > threshold, optionally padded by pre/post seconds."""
+    above = np.abs(trigger) > threshold
     padded = np.concatenate([[False], above, [False]])
     changes = np.diff(padded.astype(int))
     starts = np.where(changes == 1)[0]
@@ -54,23 +31,20 @@ def detect_events(
 
     windows: list[SegmentWindow] = []
     for s, e in zip(starts, ends):
-        e = min(int(e), len(time) - 1)
         s = int(s)
-        if time[e] - time[s] < min_duration:
+        e = min(int(e), len(time) - 1)
+        t_s = max(float(time[0]), float(time[s]) - pre_window_s)
+        t_e = min(float(time[-1]), float(time[e]) + post_window_s)
+        i0 = int(np.searchsorted(time, t_s))
+        i1 = int(np.searchsorted(time, t_e))
+        if i1 - i0 < 4:
             continue
-        rpm_seg = rpm[s:e]
-        w = SegmentWindow(
-            t_start=float(time[s]),
-            t_end=float(time[e]),
-            i_start=s,
-            i_end=e,
-            mean_rpm=float(np.mean(np.abs(rpm_seg))),
-        )
-        plateau = _find_plateau(rpm_seg, speed_tol=speed_tol)
-        if plateau is not None:
-            p0, p1 = plateau
-            p1 = min(p1, len(rpm_seg) - 1)
-            w.plateau_t_start = float(time[s + p0])
-            w.plateau_t_end = float(time[s + p1])
-        windows.append(w)
+        trig_seg = trigger[i0:i1]
+        windows.append(SegmentWindow(
+            t_start=t_s,
+            t_end=t_e,
+            i_start=i0,
+            i_end=i1,
+            mean_trigger=float(np.mean(np.abs(trig_seg))),
+        ))
     return windows
