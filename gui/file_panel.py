@@ -34,8 +34,23 @@ class FilePanel(QWidget):
         self._table.verticalHeader().setVisible(False)
         layout.addWidget(self._table)
 
+        self._help_label = QLabel(
+            "Load one or more CSV files. Assign each file a category label — "
+            "files with the same label are averaged together on the spectrum plots."
+        )
+        self._help_label.setWordWrap(True)
+        self._help_label.setVisible(False)
+        self._help_label.setStyleSheet(
+            "background:#fffbe6;border:1px solid #e6d800;"
+            "border-radius:3px;padding:4px;font-size:11px;"
+        )
+        layout.addWidget(self._help_label)
+
         self._add_btn.clicked.connect(self._add_files)
         self._clear_btn.clicked.connect(self._clear)
+
+    def set_help_visible(self, visible: bool):
+        self._help_label.setVisible(visible)
 
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(

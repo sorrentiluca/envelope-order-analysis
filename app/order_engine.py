@@ -9,6 +9,12 @@ from core.resampling import resample_to_uniform_angle
 from core.spectrum import compute_order_spectrum, interpolate_to_common_orders, average_spectra_rms
 
 
+def rpm_to_angle(time: np.ndarray, rpm: np.ndarray) -> np.ndarray:
+    """Integrate RPM to synthesize cumulative angle in degrees."""
+    dt = np.diff(time, prepend=time[0])
+    return np.cumsum(np.abs(rpm) * dt / 60.0 * 360.0)
+
+
 def compute_order_spectrum_from_arrays(
     angle: np.ndarray,
     accel: np.ndarray,

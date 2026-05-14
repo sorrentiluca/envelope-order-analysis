@@ -1,7 +1,7 @@
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QTableWidget,
-    QTableWidgetItem, QHeaderView, QGroupBox, QColorDialog,
+    QTableWidgetItem, QHeaderView, QGroupBox, QColorDialog, QLabel,
 )
 from PySide6.QtGui import QColor
 from app.marker_model import FaultOrder
@@ -38,10 +38,25 @@ class OrdersPanel(QWidget):
         inner.addWidget(add_btn)
         box.setLayout(inner)
 
+        self._help_label = QLabel(
+            "Add fundamental shaft orders (e.g. 5.35× for ball-pass, 20× for gear mesh). "
+            "Vertical lines appear at each harmonic multiple. Each order gets its own colour."
+        )
+        self._help_label.setWordWrap(True)
+        self._help_label.setVisible(False)
+        self._help_label.setStyleSheet(
+            "background:#fffbe6;border:1px solid #e6d800;"
+            "border-radius:3px;padding:4px;font-size:11px;"
+        )
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(box)
+        layout.addWidget(self._help_label)
         self._color_idx = 0
+
+    def set_help_visible(self, visible: bool):
+        self._help_label.setVisible(visible)
 
     def _append_row(self, fo: FaultOrder | None = None):
         if fo is None:

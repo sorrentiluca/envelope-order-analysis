@@ -64,6 +64,18 @@ def estimate_fs(time: np.ndarray) -> float:
     return fs
 
 
+def detect_encoder_ppr(angle_raw: np.ndarray) -> int:
+    """Estimate encoder pulses-per-revolution from angle step size."""
+    steps = np.abs(np.diff(angle_raw))
+    valid = steps[steps > 0]
+    if len(valid) == 0:
+        return 1024
+    effective_step = float(np.median(valid))
+    if effective_step <= 0:
+        return 1024
+    return int(round(360.0 / effective_step))
+
+
 def report_encoder_resolution(angle_raw: np.ndarray, cfg: Config) -> None:
     steps = np.abs(np.diff(angle_raw))
     effective_step = np.median(steps[steps > 0])
