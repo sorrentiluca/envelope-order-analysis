@@ -22,7 +22,7 @@ from app.order_engine import (
     compute_order_spectrum_from_arrays, average_order_spectra, rpm_to_angle,
 )
 from app.segmentation_engine import SegmentWindow, detect_events
-from core.io import estimate_fs, detect_encoder_ppr
+from core.io import load_data, estimate_fs, detect_encoder_ppr
 
 
 class _Worker(QObject):
@@ -54,7 +54,7 @@ class _Worker(QObject):
             order_src = self.col_map.get("order_source", "angle")
 
             for entry in self.entries:
-                df = pd.read_csv(entry.file_path)
+                df = load_data(entry.file_path)
                 if not t_col or t_col not in df.columns:
                     continue
 

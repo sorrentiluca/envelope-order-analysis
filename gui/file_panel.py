@@ -55,7 +55,7 @@ class FilePanel(QWidget):
     def _add_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select data files", "",
-            "Data files (*.csv *.tsv *.txt);;All files (*)"
+            "Data files (*.csv *.tsv *.txt *.dxd);;All files (*)"
         )
         for p in paths:
             self._append_row(p)

@@ -10,8 +10,43 @@ from .config import Config
 
 
 def load_data(file_path: str) -> pd.DataFrame:
-    df = pd.read_csv(file_path)
+    if file_path.lower().endswith(".dxd"):
+        df = _load_dxd(file_path)
+    else:
+        df = pd.read_csv(file_path)
     print(f"  Loaded {len(df):,} rows  <- {os.path.basename(file_path)}")
+    return df
+
+
+def _load_dxd(file_path: str) -> pd.DataFrame:
+    import h5py
+    channels: dict[str, np.ndarray] = {}
+    time_array: np.ndarray | None = None
+
+    with h5py.File(file_path, "r") as f:
+        for key in f.keys():
+            item = f[key]
+            if isinstance(item, h5py.Dataset):
+                channels[key] = item[:]
+            elif isinstance(item, h5py.Group):
+                # DEWEsoft channel group: expect 'data' dataset; 'time' for timestamps
+                if "data" in item:
+                    channels[key] = item["data"][:]
+                if time_array is None and "time" in item:
+                    time_array = item["time"][:]
+                elif time_array is None and "Time" in item:
+                    time_array = item["Time"][:]
+
+    if not channels:
+        raise ValueError(f"No readable channel data found in DXD file: {os.path.basename(file_path)}")
+
+    # Align all channels to the minimum length (channels may differ by 1 sample at EOF)
+    min_len = min(len(v) for v in channels.values())
+    df = pd.DataFrame({k: v[:min_len] for k, v in channels.items()})
+
+    if time_array is not None and "time" not in df.columns and "Time" not in df.columns:
+        df.insert(0, "time", time_array[:min_len])
+
     return df
 
 

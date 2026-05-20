@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal
 
 from gui.canvas_widget import CanvasWidget
 from app.segmentation_engine import SegmentWindow
+from core.io import load_data
 
 
 class PreviewPanel(QWidget):
@@ -106,7 +107,7 @@ class PreviewPanel(QWidget):
     def _load_df(self, path: str) -> Optional[pd.DataFrame]:
         if path not in self._df_cache:
             try:
-                self._df_cache[path] = pd.read_csv(path)
+                self._df_cache[path] = load_data(path)
             except Exception:
                 return None
         return self._df_cache[path]
